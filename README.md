@@ -1,4 +1,127 @@
-# MedMCQA RAG Chatbot
+# MedMCQA RAG Chatbot → Dental Clinic Agent
+
+This project contains a RAG chatbot over MedMCQA and California Dental Association documents, and a
+**tool-calling LLM agent** built on top of it. The agent plans, picks tools with **OpenAI function
+calling**, reads the results and repeats (ReAct style) until it can answer. The RAG pipeline is one
+of its tools.
+
+## Dental Agent
+
+### How the agent works (ReAct loop)
+
+Each step is **Thought → Action → Observation**: the LLM plans, calls tools, reads their results,
+and repeats until it can answer.
+
+```mermaid
+flowchart TD
+    Q(["User question"]) --> T["Thought<br/>LLM plans the next step"]
+    T --> D{"Needs a tool?"}
+    D -- "yes" --> A["Action<br/>call one or more tools"]
+    D -- "no" --> ANS(["Final answer with sources"])
+
+    A --> T1["search_dental_knowledge<br/>FAISS + BM25 → RRF → rerank"]
+    A --> T2["lookup_drug_info<br/>openFDA drug labels"]
+    A --> T3["calculate_max_dose<br/>deterministic dose maths"]
+
+    T1 --> O["Observation<br/>results or errors go back to the LLM"]
+    T2 --> O
+    T3 --> O
+
+    O --> L{"Max agent steps<br/>reached?"}
+    L -- "no, next step" --> T
+    L -- "yes" --> F["Tools switched off<br/>answer from results so far"]
+    F --> ANS
+```
+
+### Tools
+
+| Tool | What it does | Why it is a tool |
+|---|---|---|
+| `search_dental_knowledge` | Hybrid FAISS + BM25 retrieval with RRF and cross-encoder reranking (the RAG pipeline) | Grounds answers in the knowledge base |
+| `lookup_drug_info` | Official FDA drug labels from the public openFDA API | Live external data the model cannot know |
+| `calculate_max_dose` | Maximum local anaesthetic dose in mg and cartridges | LLMs are unreliable at arithmetic; this is deterministic |
+
+### Code
+
+```text
+agent/
+|-- loop.py            # the function-calling loop (no framework): plan -> act -> observe -> answer
+|-- prompts.py         # system prompt
+|-- tools/
+|   |-- base.py        # Tool + ToolRegistry: Python function -> OpenAI tool schema; errors go back to the model
+|   |-- knowledge.py   # wraps src/retrieval.py (same FAISS index, same rerank threshold)
+|   |-- drug_info.py   # openFDA client
+|   `-- dosing.py      # dose calculator
+|-- __main__.py        # CLI: uv run python -m agent "question"
+`-- app.py             # Streamlit chat UI showing tools used and the agent trace
+tests/                 # 27 offline tests (fake model client, fake retrieval, mocked HTTP)
+```
+
+### Run it
+
+With `OPENAI_API_KEY` in `.env`:
+
+```powershell
+uv sync
+uv run pytest
+```
+
+Ask one question from the terminal:
+
+```powershell
+uv run python -m agent "Max lidocaine 2% dose for a 60 kg patient, in cartridges?"
+```
+
+Launch the agent UI:
+
+```powershell
+uv run streamlit run agent/app.py
+```
+
+Always start Streamlit with `uv run`. A plain `streamlit run` may pick up a global Python
+installation that does not have `faiss` and fails with `Could not import faiss python package`.
+
+`search_dental_knowledge` needs the FAISS index from the RAG setup below (steps 5–6). Without it,
+the tool returns an error, and the agent keeps working with the other two tools.
+
+Set `AGENT_MODEL` to change the model. To try a local model, point the OpenAI client at Ollama's
+OpenAI-compatible API: `OPENAI_BASE_URL=http://localhost:11434/v1`, `OPENAI_API_KEY=ollama`,
+`AGENT_MODEL=qwen2.5:7b` (use a model that supports tool calling).
+
+> The dose reference values in `agent/tools/dosing.py` are commonly cited dental maximums.
+> Educational use only, not medical advice.
+
+### Agent UI
+
+For each answer, `agent/app.py` shows:
+
+- **Tools used**: the tools the agent called, in order, e.g.
+  `search_dental_knowledge → lookup_drug_info`.
+- **Agent trace** (the "Done · N tool calls" panel): the agent's plan, then every tool call with
+  its arguments, run time and result.
+
+### Max agent steps
+
+**Max agent steps** (sidebar, default 6) caps how many rounds of *call tools → read results* the
+agent may do before it must answer. It exists to **prevent infinite loops**: an LLM can keep
+searching with slightly different queries and never stop. When the limit is reached, tools are
+switched off and the model is told to answer from the results it already has, so the user always
+gets an answer.
+
+It is a limit, not a target: a simple question uses one step, and one step can run several tools
+at once. The limit also caps cost and waiting time (at most `max_steps + 1` model calls per
+question).
+
+### Known limitations
+
+- The agent can only find what is in the knowledge base. For example, nothing in the MedMCQA
+  dental rows or the CDA PDFs covers dry socket, so both the RAG and the agent return "not found".
+- After a failed search the agent does not retry with a synonym (e.g. *alveolar osteitis*).
+- The model sometimes adds facts from memory or overstates a drug label despite the system prompt.
+
+---
+
+# Original RAG pipeline
 
 This project builds a small retrieval-augmented generation (RAG) pipeline over the MedMCQA dataset and a set of dental PDF reference documents. It exports the dataset to CSV, extracts PDFs to Markdown, stores the mixed corpus in FAISS, and exposes retrieval through both a terminal script and a Streamlit chatbot.
 
@@ -43,10 +166,10 @@ grp-asgmt/
 |           |-- index.faiss
 |           `-- index.pkl
 |-- src/
-|   |-- datasets.py
+|   |-- datasets_rag.py
 |   |-- preprocessing.py
 |   |-- retrieval.py
-|   `-- interface.py
+|   `-- interface_new.py
 |-- AGENTS.md
 |-- pyproject.toml
 |-- uv.lock
@@ -85,7 +208,7 @@ OPENAI_API_KEY=your_api_key_here
 ### 5. Export the MedMCQA dataset to CSV
 
 ```powershell
-python src/datasets.py
+uv run python src/datasets_rag.py
 ```
 
 This writes:
@@ -102,8 +225,12 @@ The exported CSV keeps only:
 ### 6. Build the FAISS vector store
 
 ```powershell
-python src/preprocessing.py
+uv run python src/preprocessing.py
 ```
+
+Data paths in `src/preprocessing.py` are anchored to the repo root, so this script, `retrieval.py`
+and the Streamlit interfaces work from any folder. The evaluation scripts (steps 8–9) still use
+paths relative to the current folder, so run them from the repo root.
 
 This writes:
 
@@ -115,7 +242,7 @@ data/vectorstores/mixed/index.pkl
 ### 7. Test retrieval from the terminal
 
 ```powershell
-python src/retrieval.py --source all
+uv run python src/retrieval.py --source all
 ```
 
 You will be prompted for a question. The script then:
@@ -130,7 +257,7 @@ You will be prompted for a question. The script then:
 ### 8. Run RAGAS evaluation
 
 ```powershell
-python src/evaluate_ragas.py
+uv run python src/evaluate_ragas.py
 ```
 
 The evaluator expects `data/evals/qa_eval.csv` with:
@@ -145,7 +272,7 @@ It uses `gpt-4o` as the RAGAS judge model and writes per-sample traces and metri
 ### 9. Tune the rerank acceptance threshold
 
 ```powershell
-python src/tune_rerank_threshold.py
+uv run python src/tune_rerank_threshold.py
 ```
 
 The tuner expects `data/evals/rerank_threshold_eval.csv` with:
@@ -159,12 +286,12 @@ It runs live retrieval against all sources, saves per-question rerank scores, sw
 ### 10. Launch the Streamlit chatbot
 
 ```powershell
-streamlit run src/interface.py
+uv run streamlit run src/interface_new.py
 ```
 
 The UI:
 
-- keeps visible chat history
+- keeps chat rooms in the sidebar that you can create, rename and delete
 - treats each user question independently
 - caches the vector store for faster reuse
 - shows the latest retrieval diagnostics in a separate panel
@@ -189,7 +316,7 @@ If the top reranked match is below the rerank acceptance threshold:
 
 ### 1. Data export
 
-File: [src/datasets.py](C:/Users/teohr/Downloads/UM/NLP/grp-asgmt/src/datasets.py)
+File: [src/datasets_rag.py](src/datasets_rag.py)
 
 Responsibilities:
 
@@ -200,7 +327,7 @@ Responsibilities:
 
 ### 2. Indexing
 
-File: [src/preprocessing.py](C:/Users/teohr/Downloads/UM/NLP/grp-asgmt/src/preprocessing.py)
+File: [src/preprocessing.py](src/preprocessing.py)
 
 Responsibilities:
 
@@ -212,7 +339,7 @@ Responsibilities:
 
 ### 3. Retrieval and generation
 
-File: [src/retrieval.py](C:/Users/teohr/Downloads/UM/NLP/grp-asgmt/src/retrieval.py)
+File: [src/retrieval.py](src/retrieval.py)
 
 Responsibilities:
 
@@ -226,7 +353,7 @@ Responsibilities:
 
 ### 4. User interface
 
-File: [src/interface.py](C:/Users/teohr/Downloads/UM/NLP/grp-asgmt/src/interface.py)
+File: [src/interface_new.py](src/interface_new.py)
 
 Responsibilities:
 
@@ -275,6 +402,15 @@ MedMCQA dataset
 - Tune the rerank acceptance threshold on a validation set instead of using a fixed provisional value.
 - Package the `src` directory more cleanly to avoid script-relative import fragility.
 - Change to locally hosted models, including `gemma-4` and `multilingual-embeddings`
+
+### Agent
+
+- Port the hand-written loop to **LangGraph**: model the ReAct loop as a graph (plan → call tools →
+  observe → answer) with built-in state, checkpointing and conversation memory.
+- Rewrite or retry the knowledge-base search with synonyms (e.g. *alveolar osteitis* for dry socket)
+  when the first search is rejected.
+- Evaluate the agent against the RAG baseline: answer quality, tool-choice accuracy, number of steps,
+  latency and cost.
 
 ## Notes
 

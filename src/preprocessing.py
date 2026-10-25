@@ -10,10 +10,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_mineru import MinerULoader
 
 
-DATA_PATH = Path("data/raw/medmcqa_data.csv")
-PDF_DIR = Path("data/raw/pdf")
-MARKDOWN_DIR = Path("data/processed/pdf_markdown")
-VECTORSTORE_DIR = Path("data/vectorstores/mixed")
+# Anchor data paths to the repo root so scripts work from any working directory.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_PATH = PROJECT_ROOT / "data/raw/medmcqa_data.csv"
+PDF_DIR = PROJECT_ROOT / "data/raw/pdf"
+MARKDOWN_DIR = PROJECT_ROOT / "data/processed/pdf_markdown"
+VECTORSTORE_DIR = PROJECT_ROOT / "data/vectorstores/mixed"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHUNK_SIZE = 600
